@@ -21,6 +21,7 @@ Besides the vendor-provided app features (color setting, push-to-talk or toggle 
 * PulseAudio backend: works against a real PulseAudio server, or PipeWire's PulseAudio-compatibility layer. Since there's no push notification for external changes on this path, it polls a few times a second to detect them.
 * Selecting the audio device: Select a specific audio-device or the selected default device separately for mute and unmute. The default is to mute/unmute all sources.
 * Hybrid mode: If you prefer push-to-talk, but sometimes get tired of holding the button, you can double-tap, and it will leave the mic open until you touch once again, similar to toggle mode.
+* Hotplug / KVM friendly: The app doesn't need the button to be present when it starts, and it survives the button being unplugged and plugged back in (e.g. when it sits behind a KVM switch). While the device is absent it retries every couple of seconds; on reconnect it immediately restores the LED to the current mute state.
 
 # Missing features
 
@@ -107,6 +108,10 @@ systemctl --user enable --now mutebtn.service
 Logs are available via `journalctl --user -u mutebtn.service -f`. The device also needs a udev
 rule granting your user access to it (e.g. `KERNEL=="hidraw*", ATTRS{idVendor}=="20a0", ATTRS{idProduct}=="42da", MODE="0666"`
 in a file under `/etc/udev/rules.d/`), or the service will fail to open the USB device.
+
+The service does not depend on the device being attached: it starts without it and picks it up
+whenever it appears, and it keeps running when the device is removed (e.g. switched away on a KVM).
+Connects/disconnects are logged as `Connected to MuteMe device` / `MuteMe device disconnected`.
 
 ## Development plans
 
