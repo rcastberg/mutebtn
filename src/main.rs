@@ -165,6 +165,7 @@ fn main() -> Result<(), HidError> {
                     // (system tray, another app). Only reflect it in the LED - do not
                     // echo it back with SetMuteStatus, or we'd fight the user's change.
                     if state != is_muted {
+                        println!("Audio server reports muted={}", state);
                         is_muted = state;
                         transition = false;
                     }

@@ -505,8 +505,20 @@ pub fn run(
                             };
                             if let Some(state) = state_weak.upgrade() {
                                 let mut state = state.borrow_mut();
+                                let mut device_id = None;
                                 if let Some(n) = state.nodes.get_mut(&node_id) {
                                     n.muted = Some(muted);
+                                    device_id = n.device_id;
+                                }
+                                // A mute change made elsewhere (wpctl, system tray)
+                                // updates the parent Device's hardware Route as well,
+                                // but at least some ALSA devices never push a Route
+                                // param-changed event for it - only this node's Props
+                                // event arrives. Since the route is what
+                                // `observed_mute` trusts, re-read it explicitly here
+                                // or the app would keep seeing the stale route state.
+                                if let Some(dev) = device_id.and_then(|id| state.devices.get(&id)) {
+                                    dev.device.enum_params(0, Some(ParamType::Route), 0, u32::MAX);
                                 }
                                 state.publish_if_changed();
                             }
