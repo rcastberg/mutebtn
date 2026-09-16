@@ -14,6 +14,7 @@ use signal_hook::{
 };
 use std::{
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -22,6 +23,13 @@ use crate::audio::{AudioBackendKind, AudioMessage, DeviceSettings};
 use crate::muteme::{
     ControlMessage, DeviceEvent, ExecMessage, IntMessage, MuteMeSettings, OperationMode,
 };
+
+/// Set just before the shutdown signal handler tells every thread to stop, so
+/// the audio backend thread can tell an intentional shutdown apart from it
+/// unexpectedly falling over (e.g. the PipeWire connection dying) - which is
+/// treated as fatal (see the audio_thread setup in `main`), since a silently
+/// dead audio backend is worse than a visible crash-and-restart under systemd.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -135,6 +143,16 @@ fn main() -> Result<(), HidError> {
                 audio_receiver,
                 audio_ctrl_sender,
             ),
+        }
+        // The backend only returns on an intentional shutdown (Terminate) or
+        // because something it can't recover from (e.g. the PipeWire
+        // connection died) made it give up. The latter would otherwise leave
+        // the button/LED thread running normally while silently controlling
+        // no audio at all - exit hard instead so systemd notices and
+        // restarts the whole thing.
+        if !SHUTTING_DOWN.load(Ordering::SeqCst) {
+            println!("Audio backend exited unexpectedly - exiting so the service can restart");
+            std::process::exit(1);
         }
     });
 
@@ -377,6 +395,7 @@ fn main() -> Result<(), HidError> {
     thread::spawn(move || {
         for sig in signals.forever() {
             println!("Received signal {:?}", sig);
+            SHUTTING_DOWN.store(true, Ordering::SeqCst);
             int_sender.send(IntMessage::Terminate).unwrap_or(());
             ctrl_sender.send(ControlMessage::Terminate).unwrap_or(());
             exec_sender.send(ExecMessage::Terminate).unwrap_or(());

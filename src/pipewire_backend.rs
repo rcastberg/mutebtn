@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::audio::{AudioMessage, DeviceSettings, MuteDeviceSelector};
@@ -388,6 +389,25 @@ pub fn run(
             return;
         },
     };
+
+    // Without this, a lost server connection (PipeWire restarting, a protocol
+    // error) leaves the mainloop running but no longer processing anything -
+    // silently deaf, with no indication anything is wrong. id == 0 is the
+    // core object itself, i.e. the connection as a whole.
+    let main_loop_for_core_error = main_loop.clone();
+    let _core_listener = core
+        .add_listener_local()
+        .error(move |id, seq, res, message| {
+            println!(
+                "PipeWire core error (id={}, seq={}, res={}): {}",
+                id, seq, res, message
+            );
+            if id == 0 {
+                main_loop_for_core_error.quit();
+            }
+        })
+        .register();
+
     let registry = match core.get_registry_rc() {
         Ok(r) => r,
         Err(err) => {
@@ -641,11 +661,31 @@ pub fn run(
         })
         .register();
 
+    // Tracks whether the mainloop's dispatch is still actually running, since
+    // its thread can go silently unresponsive without erroring or panicking
+    // (e.g. a wedged event loop) - in which case nothing inside this thread,
+    // including the core error listener above, ever runs again to notice.
+    let last_tick = Arc::new(Mutex::new(Instant::now()));
+    let last_tick_for_timer = last_tick.clone();
     let state_for_retry = state.clone();
     let retry_timer = main_loop.loop_().add_timer(move |_| {
+        *last_tick_for_timer.lock().unwrap() = Instant::now();
         state_for_retry.borrow().retry_pending();
     });
     retry_timer.update_timer(Some(Duration::from_millis(300)), Some(Duration::from_millis(300)));
+
+    const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(15);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(3));
+        let elapsed = last_tick.lock().unwrap().elapsed();
+        if elapsed > WATCHDOG_TIMEOUT {
+            println!(
+                "PipeWire mainloop unresponsive for {:?} - exiting so the service can restart",
+                elapsed
+            );
+            std::process::exit(1);
+        }
+    });
 
     main_loop.run();
 }
