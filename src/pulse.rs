@@ -1,35 +1,11 @@
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use pulsectl::controllers::{DeviceControl, SourceController};
-use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
-#[derive(Debug)]
-pub enum AudioMessage {
-    GetMuteStatus,
-    SetMuteStatus(bool),
-    Terminate,
-}
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PulseMuteDevice {
-    All,
-    Default,
-    Selected,
-}
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PulseSettings {
-    pub mute_device: PulseMuteDevice,
-    pub unmute_device: Option<PulseMuteDevice>,
-    pub selected_device_name: String,
-}
-impl Default for PulseSettings {
-    fn default() -> Self {
-        Self {
-            mute_device: PulseMuteDevice::All,
-            unmute_device: Some(PulseMuteDevice::All),
-            selected_device_name: String::from(""),
-        }
-    }
-}
+use crate::audio::{AudioMessage, MuteDeviceSelector};
+use crate::muteme::ControlMessage;
+
+pub use crate::audio::DeviceSettings as PulseSettings;
 
 pub trait Mute {
     fn is_muted(&mut self) -> bool;
@@ -53,7 +29,7 @@ impl Mute for PulseControl {
             None => &self.settings.mute_device,
         };
         match device {
-            PulseMuteDevice::All => {
+            MuteDeviceSelector::All => {
                 let devices_res = &self.handler.list_devices();
                 match devices_res {
                     Ok(devices) => {
@@ -70,7 +46,7 @@ impl Mute for PulseControl {
                 }
                 true
             },
-            PulseMuteDevice::Default => match self.handler.get_server_info() {
+            MuteDeviceSelector::Default => match self.handler.get_server_info() {
                 Ok(server_info) => match server_info.default_source_name {
                     Some(device_name) => {
                         return match &self.handler.get_device_by_name(&device_name) {
@@ -91,7 +67,7 @@ impl Mute for PulseControl {
                     false
                 },
             },
-            PulseMuteDevice::Selected => {
+            MuteDeviceSelector::Selected => {
                 return match &self
                     .handler
                     .get_device_by_name(&self.settings.selected_device_name)
@@ -117,12 +93,12 @@ impl Mute for PulseControl {
             };
         }
         match device {
-            PulseMuteDevice::All => {
+            MuteDeviceSelector::All => {
                 let devices_res = &self.handler.list_devices();
                 match devices_res {
                     Ok(devices) => {
                         for dev in devices {
-                            &self.handler.set_device_mute_by_index(dev.index, muted);
+                            let _ = self.handler.set_device_mute_by_index(dev.index, muted);
                         }
                     },
                     Err(_) => {
@@ -130,10 +106,10 @@ impl Mute for PulseControl {
                     },
                 }
             },
-            PulseMuteDevice::Default => match self.handler.get_server_info() {
+            MuteDeviceSelector::Default => match self.handler.get_server_info() {
                 Ok(server_info) => match server_info.default_source_name {
                     Some(device_name) => {
-                        &self.handler.set_device_mute_by_name(&device_name, muted);
+                        let _ = self.handler.set_device_mute_by_name(&device_name, muted);
                     },
                     None => {
                         println!("No default device selected");
@@ -143,11 +119,58 @@ impl Mute for PulseControl {
                     println!("Failed to get server info");
                 },
             },
-            PulseMuteDevice::Selected => {
-                &self
+            MuteDeviceSelector::Selected => {
+                let _ = self
                     .handler
                     .set_device_mute_by_name(&self.settings.selected_device_name, muted);
             },
+        }
+    }
+}
+
+/// Runs the PulseAudio backend thread. PulseAudio has no push-based mute change
+/// notifications available here, so this polls for changes made outside this app
+/// (e.g. system tray, another app) and reports them upstream, instead of only
+/// reacting to explicit requests - and without ever re-asserting a stale cached
+/// state onto the server.
+pub fn run(
+    settings: PulseSettings,
+    mute_on_startup: Option<bool>,
+    audio_receiver: Receiver<AudioMessage>,
+    audio_ctrl_sender: Sender<ControlMessage>,
+) {
+    let mut terminated = false;
+    let mut pulse_control = PulseControl::new(settings);
+    let mut last_known_muted = None;
+    if let Some(muted) = mute_on_startup {
+        pulse_control.set_muted(muted);
+        last_known_muted = Some(muted);
+    }
+    while !terminated {
+        let res = audio_receiver.recv_timeout(Duration::from_millis(300));
+        match res {
+            Ok(AudioMessage::GetMuteStatus) => {
+                let is_muted = pulse_control.is_muted();
+                last_known_muted = Some(is_muted);
+                audio_ctrl_sender
+                    .send(ControlMessage::PublishMuteStatus(is_muted))
+                    .unwrap_or(());
+            },
+            Ok(AudioMessage::SetMuteStatus(new_state)) => {
+                pulse_control.set_muted(new_state);
+                last_known_muted = Some(new_state);
+            },
+            Ok(AudioMessage::Terminate) => terminated = true,
+            Err(RecvTimeoutError::Timeout) => {
+                let is_muted = pulse_control.is_muted();
+                if last_known_muted != Some(is_muted) {
+                    last_known_muted = Some(is_muted);
+                    audio_ctrl_sender
+                        .send(ControlMessage::PublishMuteStatus(is_muted))
+                        .unwrap_or(());
+                }
+            },
+            Err(RecvTimeoutError::Disconnected) => terminated = true,
         }
     }
 }

@@ -1,0 +1,13 @@
+[Unit]
+Description=MuteMe button daemon
+# PipeWire/PulseAudio are user-session services; this must run as a user
+# unit alongside them, not as a system service.
+After=pipewire.service pipewire-pulse.service wireplumber.service
+
+[Service]
+ExecStart=/usr/local/bin/mutebtn
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

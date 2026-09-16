@@ -1,11 +1,12 @@
+mod audio;
 mod muteme;
+mod pipewire_backend;
 mod pulse;
 
 use clap::{clap_app, ArgMatches};
 use config::{Config, ConfigError, File};
 use crossbeam_channel::{unbounded, RecvError, RecvTimeoutError};
 use hidapi::{HidDevice, HidError};
-use pulse::PulseSettings;
 use serde::{Deserialize, Serialize};
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
@@ -17,20 +18,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::audio::{AudioBackendKind, AudioMessage, DeviceSettings};
 use crate::muteme::{
     ControlMessage, DeviceEvent, ExecMessage, IntMessage, MuteMeSettings, OperationMode,
 };
-use crate::pulse::{AudioMessage, Mute, PulseControl};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct MainSettings {
     mute_on_startup: Option<bool>,
+    backend: AudioBackendKind,
 }
 impl Default for MainSettings {
     fn default() -> Self {
         Self {
             mute_on_startup: None,
+            backend: AudioBackendKind::default(),
         }
     }
 }
@@ -39,14 +42,16 @@ impl Default for MainSettings {
 struct Settings {
     main: MainSettings,
     muteme: MuteMeSettings,
-    pulse: PulseSettings,
+    pulse: DeviceSettings,
+    pipewire: DeviceSettings,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             main: MainSettings::default(),
             muteme: MuteMeSettings::default(),
-            pulse: PulseSettings::default(),
+            pulse: DeviceSettings::default(),
+            pipewire: DeviceSettings::default(),
         }
     }
 }
@@ -114,30 +119,22 @@ fn main() -> Result<(), HidError> {
     let (exec_sender, exec_receiver) = unbounded();
     let (audio_sender, audio_receiver) = unbounded();
 
+    let backend = settings.main.backend;
     let pulse_settings = settings.pulse;
+    let pipewire_settings = settings.pipewire;
     let mute_on_startup = settings.main.mute_on_startup.clone();
     let audio_ctrl_sender = ctrl_sender.clone();
     let audio_thread = thread::spawn(move || -> () {
-        let mut terminated = false;
-        let mut pulse_control = PulseControl::new(pulse_settings);
-        if let Some(muted) = mute_on_startup {
-            pulse_control.set_muted(muted);
-        }
-        while !terminated {
-            let res = audio_receiver.recv();
-            match res {
-                Ok(AudioMessage::GetMuteStatus) => {
-                    let is_muted = pulse_control.is_muted();
-                    audio_ctrl_sender
-                        .send(ControlMessage::PublishMuteStatus(is_muted))
-                        .unwrap_or(());
-                },
-                Ok(AudioMessage::SetMuteStatus(new_state)) => {
-                    pulse_control.set_muted(new_state);
-                },
-                Ok(AudioMessage::Terminate) => terminated = true,
-                Err(RecvError) => terminated = true,
-            }
+        match backend {
+            AudioBackendKind::Pulseaudio => {
+                pulse::run(pulse_settings, mute_on_startup, audio_receiver, audio_ctrl_sender)
+            },
+            AudioBackendKind::Pipewire => pipewire_backend::run(
+                pipewire_settings,
+                mute_on_startup,
+                audio_receiver,
+                audio_ctrl_sender,
+            ),
         }
     });
 
@@ -149,6 +146,7 @@ fn main() -> Result<(), HidError> {
         let mut terminated = false;
         let mut is_muted = false;
         let mut transition = false;
+        let mut pending_audio_update = false;
         ctrl_audio_sender
             .send(AudioMessage::GetMuteStatus)
             .unwrap_or(());
@@ -163,6 +161,9 @@ fn main() -> Result<(), HidError> {
             let res = ctrl_receiver.recv_timeout(Duration::from_secs(5));
             match res {
                 Ok(ControlMessage::PublishMuteStatus(state)) => {
+                    // State reported by the audio backend, e.g. after an external change
+                    // (system tray, another app). Only reflect it in the LED - do not
+                    // echo it back with SetMuteStatus, or we'd fight the user's change.
                     if state != is_muted {
                         is_muted = state;
                         transition = false;
@@ -179,6 +180,7 @@ fn main() -> Result<(), HidError> {
                 Ok(ControlMessage::SetMode(new_mode)) => {
                     muteme_settings.operation_mode = new_mode;
                     is_muted = true;
+                    pending_audio_update = true;
                     transition = false;
                 },
                 Ok(ControlMessage::Event(event)) => {
@@ -243,6 +245,7 @@ fn main() -> Result<(), HidError> {
                     };
                     if is_muted != new_state {
                         is_muted = new_state;
+                        pending_audio_update = true;
                         transition = false;
                     }
                 },
@@ -255,6 +258,13 @@ fn main() -> Result<(), HidError> {
                 Err(RecvTimeoutError::Disconnected) => terminated = true,
             }
 
+            if pending_audio_update {
+                ctrl_audio_sender
+                    .send(AudioMessage::SetMuteStatus(is_muted))
+                    .unwrap_or(());
+                pending_audio_update = false;
+            }
+
             let current_color = if is_muted {
                 &muteme_settings.muted_color
             } else {
@@ -264,9 +274,6 @@ fn main() -> Result<(), HidError> {
             if transition {
                 effect = 0x40;
                 transition = false;
-                ctrl_audio_sender
-                    .send(AudioMessage::SetMuteStatus(is_muted))
-                    .unwrap_or(());
             } else {
                 effect = 0x00;
                 let sub_thread_sender = ctrl_self_sender.clone();
