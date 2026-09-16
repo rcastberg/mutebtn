@@ -5,8 +5,8 @@ mod pulse;
 
 use clap::{clap_app, ArgMatches};
 use config::{Config, ConfigError, File};
-use crossbeam_channel::{unbounded, RecvError, RecvTimeoutError};
-use hidapi::{HidDevice, HidError};
+use crossbeam_channel::{unbounded, Receiver, RecvError, RecvTimeoutError};
+use hidapi::{HidApi, HidDevice, HidError};
 use serde::{Deserialize, Serialize};
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
@@ -308,45 +308,65 @@ fn main() -> Result<(), HidError> {
     });
     let exec_ctrl_sender = ctrl_sender.clone();
     let exec_thread = thread::spawn(move || {
-        let api = hidapi::HidApi::new().unwrap();
-        let device = api
-            .open(muteme::DEVICE_VID, muteme::DEVICE_PID)
-            .expect("Failed to open USB device");
-        device
-            .set_blocking_mode(false)
-            .expect("Failed to set device to non-blocking mode");
-
+        let api = hidapi::HidApi::new().expect("Failed to initialise hidapi");
         let mut terminated = false;
-        let mut state = 0;
 
         while !terminated {
-            loop {
-                let data = read_interrupt(&device);
-                match data {
-                    Some(new_state @ 1..=2) if state != new_state => {
-                        state = new_state;
-                        if state == 1 {
-                            exec_ctrl_sender
-                                .send(ControlMessage::Event(DeviceEvent::Touch))
-                                .unwrap_or(());
-                        } else {
-                            exec_ctrl_sender
-                                .send(ControlMessage::Event(DeviceEvent::Release))
-                                .unwrap_or(());
-                        }
-                    },
-                    Some(_) => {},
-                    None => break,
-                }
-                thread::yield_now();
-            }
+            // The device may be absent at startup or disappear at any time (e.g. when it
+            // sits behind a KVM switch), so never give up: keep retrying the open, and
+            // fall back here whenever a read or write fails.
+            let device = match open_device(&api) {
+                Some(device) => device,
+                None => {
+                    terminated = wait_for_retry(&exec_receiver);
+                    continue;
+                },
+            };
+            println!("Connected to MuteMe device");
+            // Prompt the control thread to push the current LED state to the fresh device.
+            exec_ctrl_sender.send(ControlMessage::Continue).unwrap_or(());
 
-            let res = exec_receiver.recv();
-            match res {
-                Ok(ExecMessage::SetReport(value)) => write_value(&device, value),
-                Ok(ExecMessage::ReadInterrupt) => continue,
-                Ok(ExecMessage::Terminate) => terminated = true,
-                Err(RecvError) => terminated = true,
+            let mut connected = true;
+            let mut state = 0;
+            while !terminated && connected {
+                loop {
+                    let data = read_interrupt(&device);
+                    match data {
+                        Ok(Some(new_state @ 1..=2)) if state != new_state => {
+                            state = new_state;
+                            if state == 1 {
+                                exec_ctrl_sender
+                                    .send(ControlMessage::Event(DeviceEvent::Touch))
+                                    .unwrap_or(());
+                            } else {
+                                exec_ctrl_sender
+                                    .send(ControlMessage::Event(DeviceEvent::Release))
+                                    .unwrap_or(());
+                            }
+                        },
+                        Ok(Some(_)) => {},
+                        Ok(None) => break,
+                        Err(()) => {
+                            connected = false;
+                            break;
+                        },
+                    }
+                    thread::yield_now();
+                }
+                if !connected {
+                    break;
+                }
+
+                let res = exec_receiver.recv();
+                match res {
+                    Ok(ExecMessage::SetReport(value)) => connected = write_value(&device, value),
+                    Ok(ExecMessage::ReadInterrupt) => continue,
+                    Ok(ExecMessage::Terminate) => terminated = true,
+                    Err(RecvError) => terminated = true,
+                }
+            }
+            if !terminated {
+                println!("MuteMe device disconnected");
             }
         }
     });
@@ -372,7 +392,40 @@ fn main() -> Result<(), HidError> {
     Ok(())
 }
 
-fn write_value(device: &HidDevice, value: u8) {
+/// How long to wait between attempts to open the device while it is absent.
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
+
+fn open_device(api: &HidApi) -> Option<HidDevice> {
+    let device = api.open(muteme::DEVICE_VID, muteme::DEVICE_PID).ok()?;
+    match device.set_blocking_mode(false) {
+        Ok(()) => Some(device),
+        Err(err) => {
+            println!("Failed to set device to non-blocking mode: {}", err);
+            None
+        },
+    }
+}
+
+/// Sleeps for RECONNECT_INTERVAL while draining (and discarding) queued messages, so the
+/// other threads don't pile up work while the device is absent. Returns true if the
+/// thread should terminate.
+fn wait_for_retry(receiver: &Receiver<ExecMessage>) -> bool {
+    let deadline = Instant::now() + RECONNECT_INTERVAL;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        match receiver.recv_timeout(deadline - now) {
+            Ok(ExecMessage::Terminate) | Err(RecvTimeoutError::Disconnected) => return true,
+            Ok(_) => {},
+            Err(RecvTimeoutError::Timeout) => return false,
+        }
+    }
+}
+
+/// Writes a report to the device. Returns false if the device appears to be gone.
+fn write_value(device: &HidDevice, value: u8) -> bool {
     let data = [0x00, value];
     let mut attempts = 3u8;
     loop {
@@ -381,27 +434,29 @@ fn write_value(device: &HidDevice, value: u8) {
         match res {
             Ok(i) => {
                 println!("Wrote {} bytes", i);
-                break;
+                return true;
             },
             Err(err) => println!("{}", err),
         };
         if attempts > 0 {
             thread::sleep(Duration::from_millis(10));
         } else {
-            break;
+            return false;
         }
     }
 }
 
-fn read_interrupt(device: &HidDevice) -> Option<u8> {
+/// Reads one interrupt report. Ok(None) means nothing pending; Err(()) means the device
+/// appears to be gone.
+fn read_interrupt(device: &HidDevice) -> Result<Option<u8>, ()> {
     let mut buf = [0u8; 8];
     let mut attempts = 3u8;
     loop {
         attempts -= 1;
         let res = device.read(&mut buf);
         match res {
-            Ok(_i @ 0) => return None,
-            Ok(_) => return Some(buf[3]),
+            Ok(_i @ 0) => return Ok(None),
+            Ok(_) => return Ok(Some(buf[3])),
             Err(err) => {
                 println!("{}", err);
             },
@@ -409,8 +464,7 @@ fn read_interrupt(device: &HidDevice) -> Option<u8> {
         if attempts > 0 {
             thread::sleep(Duration::from_millis(10));
         } else {
-            break;
+            return Err(());
         }
     }
-    None
 }
