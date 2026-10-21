@@ -271,7 +271,6 @@ fn main() -> Result<(), HidError> {
                 Ok(ControlMessage::Continue) => {},
                 Ok(ControlMessage::Terminate) => terminated = true,
                 Err(RecvTimeoutError::Timeout) => {
-                    println!("Sending keepalive");
                     transition = false;
                 },
                 Err(RecvTimeoutError::Disconnected) => terminated = true,
